@@ -1,13 +1,15 @@
 package influx2lp
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
-	"time"
+	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -17,98 +19,158 @@ type Config struct {
 	Org       string `yaml:"org"`
 	Token     string `yaml:"token"`
 	UserAgent string `yaml:"user_agent"`
-	Timeout   time.Duration
 }
 
 type LPMetric struct {
 	Measurement string
-	Tags        map[string]interface{}
+	Tags        map[string]string
 	Fields      map[string]interface{}
 	Timestamp   int64
 }
 
 func NewConfig() *Config {
-	var c Config
-	c.Timeout = 3 * time.Second
-	c.Path = "/api/v2/write"
+	c := &Config{Path: "/api/v2/write"}
 	host, err := os.Hostname()
 	if err != nil {
 		c.UserAgent = "influx2lp-unknown-host"
-		return &c
+		return c
 	}
 	c.UserAgent = "influx2lp-" + host
-	return &c
+	return c
 }
 
-// Formats an LPMetric in line protocol format for writing to InfluxDB (or printing)
+// LP escaping per https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/
+var (
+	measurementEsc = strings.NewReplacer(",", `\,`, " ", `\ `)
+	tagEsc         = strings.NewReplacer(",", `\,`, "=", `\=`, " ", `\ `)
+	fieldStrEsc    = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+)
+
+// String formats the metric in InfluxDB line protocol.
 func (m LPMetric) String() string {
-	metric := m.Measurement
-	if len(m.Tags) > 0 {
-		for k, v := range m.Tags {
-			metric = fmt.Sprintf("%s,%s=%v", metric, k, v)
-		}
-	}
-	if len(m.Fields) > 0 {
-		keys := make([]string, 0, len(m.Fields))
-		for k := range m.Fields {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+	var b strings.Builder
+	b.Grow(len(m.Measurement) + len(m.Tags)*24 + len(m.Fields)*24 + 22)
 
-		i := 0
-		for _, k := range keys {
-			field := k
-			value := m.Fields[k]
-			format := ""
-			// be careful with how we print values - append "i" to ints and do not use scientific notation for floats
-			switch value.(type) {
-			case int, int16, int32, int64:
-				format = "%di"
-			case float32, float64:
-				format = "%f"
-			case string:
-				format = "%q"
-			default:
-				format = "%v"
-			}
-			if i == 0 {
-				metric = fmt.Sprintf("%s %s="+format, metric, field, value)
-			} else {
-				metric = fmt.Sprintf("%s,%s="+format, metric, field, value)
-			}
-			i++
+	b.WriteString(measurementEsc.Replace(m.Measurement))
+
+	if len(m.Tags) > 0 {
+		tagKeys := make([]string, 0, len(m.Tags))
+		for k := range m.Tags {
+			tagKeys = append(tagKeys, k)
+		}
+		sort.Strings(tagKeys)
+		for _, k := range tagKeys {
+			b.WriteByte(',')
+			b.WriteString(tagEsc.Replace(k))
+			b.WriteByte('=')
+			b.WriteString(tagEsc.Replace(m.Tags[k]))
 		}
 	}
-	return fmt.Sprintf("%s %d", metric, m.Timestamp)
+
+	if len(m.Fields) > 0 {
+		fieldKeys := make([]string, 0, len(m.Fields))
+		for k := range m.Fields {
+			fieldKeys = append(fieldKeys, k)
+		}
+		sort.Strings(fieldKeys)
+		for i, k := range fieldKeys {
+			if i == 0 {
+				b.WriteByte(' ')
+			} else {
+				b.WriteByte(',')
+			}
+			b.WriteString(tagEsc.Replace(k))
+			b.WriteByte('=')
+			appendFieldValue(&b, m.Fields[k])
+		}
+	}
+
+	b.WriteByte(' ')
+	b.WriteString(strconv.FormatInt(m.Timestamp, 10))
+	return b.String()
 }
 
-// WriteLP formats and writes an LPMetric to InfluxDB
-func WriteLP(cli http.Client, c Config, metric LPMetric) (int, string, error) {
+func appendFieldValue(b *strings.Builder, value interface{}) {
+	switch v := value.(type) {
+	case int:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.WriteByte('i')
+	case int8:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.WriteByte('i')
+	case int16:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.WriteByte('i')
+	case int32:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.WriteByte('i')
+	case int64:
+		b.WriteString(strconv.FormatInt(v, 10))
+		b.WriteByte('i')
+	case uint:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.WriteByte('i')
+	case uint8:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.WriteByte('i')
+	case uint16:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.WriteByte('i')
+	case uint32:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.WriteByte('i')
+	case uint64:
+		b.WriteString(strconv.FormatUint(v, 10))
+		b.WriteByte('i')
+	case float32:
+		b.WriteString(strconv.FormatFloat(float64(v), 'f', -1, 32))
+	case float64:
+		b.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+	case string:
+		b.WriteByte('"')
+		b.WriteString(fieldStrEsc.Replace(v))
+		b.WriteByte('"')
+	case bool:
+		if v {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	default:
+		fmt.Fprintf(b, "%v", v)
+	}
+}
+
+// WriteLP formats and writes an LPMetric to InfluxDB.
+func WriteLP(ctx context.Context, cli *http.Client, c Config, metric LPMetric) (int, string, error) {
 	if c.Bucket == "" {
 		return 0, "", fmt.Errorf("no bucket configured")
 	}
 	if c.Org == "" {
 		return 0, "", fmt.Errorf("no org configured")
 	}
-	m := metric.String()
-	return WriteLPString(cli, c, m)
+	return WriteLPString(ctx, cli, c, metric.String())
 }
 
-// WriteLPString writes an already formatted line protocol metric string to InfluxDB
-func WriteLPString(cli http.Client, c Config, stringMetric string) (int, string, error) {
-	d := bytes.NewReader([]byte(stringMetric))
+// WriteLPString writes an already-formatted line protocol string to InfluxDB.
+func WriteLPString(ctx context.Context, cli *http.Client, c Config, stringMetric string) (int, string, error) {
+	u, err := url.Parse(c.Host + c.Path)
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid host/path: %w", err)
+	}
+	q := u.Query()
+	q.Set("org", c.Org)
+	q.Set("bucket", c.Bucket)
+	u.RawQuery = q.Encode()
 
-	uri := fmt.Sprintf("%s%s?&org=%s&bucket=%s", c.Host, c.Path, c.Org, c.Bucket)
-
-	req, err := http.NewRequest("POST", uri, d)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(stringMetric))
 	if err != nil {
 		return 0, "", err
 	}
 
-	req.Header.Set("Authorization", fmt.Sprintf("Token %s", c.Token))
+	req.Header.Set("Authorization", "Token "+c.Token)
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 	req.Header.Set("Accept", "application/json")
-
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
@@ -117,9 +179,11 @@ func WriteLPString(cli http.Client, c Config, stringMetric string) (int, string,
 	if err != nil {
 		return 0, "failed to write", err
 	}
+	defer resp.Body.Close()
+
 	if resp.StatusCode != 204 {
 		body, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, string(body), fmt.Errorf("expected status 204, got status %d (uri=%q)", resp.StatusCode, uri)
+		return resp.StatusCode, string(body), fmt.Errorf("expected status 204, got status %d (uri=%q)", resp.StatusCode, u.String())
 	}
 	return resp.StatusCode, "", nil
 }
