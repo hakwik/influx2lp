@@ -1,42 +1,19 @@
 package influx2lp
 
 import (
-	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-type Config struct {
-	Bucket    string `yaml:"bucket"`
-	Host      string `yaml:"host"`
-	Path      string `yaml:"path"`
-	Org       string `yaml:"org"`
-	Token     string `yaml:"token"`
-	UserAgent string `yaml:"user_agent"`
-}
-
+// LPMetric holds the data for a single InfluxDB line protocol measurement.
+// Tags must be strings; Fields support int*, uint*, float*, string, and bool.
 type LPMetric struct {
 	Measurement string
 	Tags        map[string]string
 	Fields      map[string]interface{}
-	Timestamp   int64
-}
-
-func NewConfig() *Config {
-	c := &Config{Path: "/api/v2/write"}
-	host, err := os.Hostname()
-	if err != nil {
-		c.UserAgent = "influx2lp-unknown-host"
-		return c
-	}
-	c.UserAgent = "influx2lp-" + host
-	return c
+	Timestamp   int64 // Unix nanoseconds
 }
 
 // LP escaping per https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/
@@ -139,51 +116,4 @@ func appendFieldValue(b *strings.Builder, value interface{}) {
 	default:
 		fmt.Fprintf(b, "%v", v)
 	}
-}
-
-// WriteLP formats and writes an LPMetric to InfluxDB.
-func WriteLP(ctx context.Context, cli *http.Client, c Config, metric LPMetric) (int, string, error) {
-	if c.Bucket == "" {
-		return 0, "", fmt.Errorf("no bucket configured")
-	}
-	if c.Org == "" {
-		return 0, "", fmt.Errorf("no org configured")
-	}
-	return WriteLPString(ctx, cli, c, metric.String())
-}
-
-// WriteLPString writes an already-formatted line protocol string to InfluxDB.
-func WriteLPString(ctx context.Context, cli *http.Client, c Config, stringMetric string) (int, string, error) {
-	u, err := url.Parse(c.Host + c.Path)
-	if err != nil {
-		return 0, "", fmt.Errorf("invalid host/path: %w", err)
-	}
-	q := u.Query()
-	q.Set("org", c.Org)
-	q.Set("bucket", c.Bucket)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(stringMetric))
-	if err != nil {
-		return 0, "", err
-	}
-
-	req.Header.Set("Authorization", "Token "+c.Token)
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	req.Header.Set("Accept", "application/json")
-	if c.UserAgent != "" {
-		req.Header.Set("User-Agent", c.UserAgent)
-	}
-
-	resp, err := cli.Do(req)
-	if err != nil {
-		return 0, "failed to write", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 204 {
-		body, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, string(body), fmt.Errorf("expected status 204, got status %d (uri=%q)", resp.StatusCode, u.String())
-	}
-	return resp.StatusCode, "", nil
 }
